@@ -17,6 +17,17 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
+    /// Verify service access against current authority. Implementations that do not
+    /// provide this capability reject verification rather than granting access.
+    async fn verify_service_grant(
+        &self,
+        _ctx: &RequestContext,
+        _request: &adx_agent_core::service_grants::VerifyServiceGrant,
+    ) -> Result<adx_agent_core::service_grants::ServiceGrantDecision> {
+        Err(Error::Unsupported(
+            "service grant verification unavailable".into(),
+        ))
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -243,12 +254,17 @@ impl ActivatorClient {
             };
             let status = response.status();
             let mut bytes = Vec::new();
+            let limit = if path == "service-grants/verify" {
+                adx_agent_core::limits::SERVICE_GRANT_JSON_BYTES
+            } else {
+                adx_agent_core::limits::HTTP_JSON_BYTES
+            };
             while let Some(chunk) = response
                 .chunk()
                 .await
                 .map_err(|_| uncertain(writes, "Activator response interrupted"))?
             {
-                if bytes.len() + chunk.len() > adx_agent_core::limits::HTTP_JSON_BYTES {
+                if bytes.len() + chunk.len() > limit {
                     return Err(uncertain(writes, "Activator response exceeds size limit"));
                 }
                 bytes.extend_from_slice(&chunk);
@@ -266,6 +282,14 @@ impl ActivatorClient {
 
 #[async_trait]
 impl Control for ActivatorClient {
+    async fn verify_service_grant(
+        &self,
+        ctx: &RequestContext,
+        request: &adx_agent_core::service_grants::VerifyServiceGrant,
+    ) -> Result<adx_agent_core::service_grants::ServiceGrantDecision> {
+        self.request(ctx, "service-grants/verify", request, false, None)
+            .await
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,

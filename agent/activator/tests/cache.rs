@@ -142,6 +142,39 @@ async fn warm_activation_skips_redis_and_platform() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_delivery_does_not_disable_cache_for_a_non_remote_template() {
+    let store = Arc::new(Store::default());
+    let platform = Arc::new(Platform::default());
+    let service = Activator::new(AgentState::new(store.clone()), platform.clone())
+        .with_credential_delivery(Some(
+            adx_activator::credential_delivery::CredentialDelivery {
+                template: "app".into(),
+                root: "/unused/identities".into(),
+                ca_file: "/unused/ca.pem".into(),
+                uid: 10001,
+                gid: 10001,
+                ttl_seconds: 3600,
+                renew_before_seconds: 600,
+            },
+        ))
+        .unwrap();
+    service
+        .publish("tenant", &TemplateDraft::from(&template()))
+        .await
+        .unwrap();
+    let first = service.activate(&scope(), None, deadline()).await.unwrap();
+    store.reads.store(0, Ordering::SeqCst);
+    platform.gets.store(0, Ordering::SeqCst);
+    assert_eq!(
+        service.activate(&scope(), None, deadline()).await.unwrap(),
+        first
+    );
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(platform.gets.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn immutable_templates_share_cached_reads_without_caching_absence() {
     let store = Arc::new(Store::default());

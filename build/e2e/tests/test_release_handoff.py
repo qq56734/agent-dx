@@ -92,6 +92,18 @@ class ReleaseArchiveTests(unittest.TestCase):
             sandboxd_source = json.loads((restored / 'third_party/sandboxd/source.json').read_text())
             self.assertEqual(sandboxd_source, json.loads((ROOT / 'third_party/sandboxd/source.json').read_text()))
 
+            (bins / 'adx-credential-crypto').write_bytes(b'fixture crypto')
+            with_crypto = root / 'built-with-crypto'
+            manifest = package.assemble(
+                bins, redis, redis_cli, wheel, with_crypto,
+                package.BuildIdentity('a' * 40, False, target, 'release'),
+            )
+            self.assertIn('bin/adx-credential-crypto', manifest['files'])
+            package.verify(with_crypto)
+            (with_crypto / 'bin/adx-credential-crypto').write_bytes(b'tampered')
+            with self.assertRaises(ValueError):
+                package.verify(with_crypto)
+
     def test_python_bytecode_does_not_dirty_build_sources(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

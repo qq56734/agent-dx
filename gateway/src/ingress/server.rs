@@ -347,11 +347,13 @@ pub struct Ingress {
     #[cfg(feature = "agent-api")]
     pub(super) agent_api: Option<Arc<super::agent_api::AgentApi>>,
     #[cfg(feature = "agent-api")]
+    credential_crypto_api: Option<Arc<super::credential_crypto::CredentialCryptoApi>>,
+    #[cfg(feature = "agent-api")]
     digitalmategateway_api:
         Option<Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>>,
     resolver: Arc<IngressRouteResolver>,
     connector: DataPlaneL4Connector,
-    http_pool: BackendHttpPool,
+    pub(super) http_pool: BackendHttpPool,
     authenticator: IngressAuthenticator,
     default_direct_port: u16,
     default_tunnel_port: u16,
@@ -390,6 +392,8 @@ impl Ingress {
             #[cfg(feature = "agent-api")]
             agent_api: None,
             #[cfg(feature = "agent-api")]
+            credential_crypto_api: None,
+            #[cfg(feature = "agent-api")]
             digitalmategateway_api: None,
             resolver,
             connector,
@@ -423,6 +427,15 @@ impl Ingress {
         api: Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>,
     ) -> Self {
         self.digitalmategateway_api = Some(api);
+        self
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub fn with_credential_crypto_api(
+        mut self,
+        api: Arc<super::credential_crypto::CredentialCryptoApi>,
+    ) -> Self {
+        self.credential_crypto_api = Some(api);
         self
     }
 
@@ -1178,6 +1191,20 @@ impl Ingress {
             self.proxy_direct(request, ingress_security).await
         } else {
             match request.uri().path() {
+                #[cfg(feature = "agent-api")]
+                path if super::credential_crypto::CredentialCryptoApi::matches(path)
+                    && self
+                        .credential_crypto_api
+                        .as_ref()
+                        .is_some_and(|api| api.matches_host(&request))
+                    && self.application_route(&request).is_none()
+                    && !self.is_control_plane_path(path) =>
+                {
+                    match &self.credential_crypto_api {
+                        Some(api) => api.handle(request, self.clone(), ingress_security).await,
+                        None => plain(StatusCode::SERVICE_UNAVAILABLE, "CRYPTO_UNAVAILABLE"),
+                    }
+                }
                 #[cfg(feature = "agent-api")]
                 path if super::digitalmategateway::entrypoint::DigitalMateGatewayApi::matches(
                     path,
@@ -2957,6 +2984,27 @@ pub struct IngressStream {
 }
 
 impl IngressStream {
+    /// The physical endpoint actually opened after any unsent route refresh.
+    #[cfg(feature = "agent-api")]
+    pub(super) fn http_pool_key(&self) -> io::Result<BackendHttpPoolKey> {
+        let sessions = self
+            ._guard
+            .sessions
+            .lock()
+            .map_err(|_| io::Error::other("session registry unavailable"))?;
+        let session = sessions
+            .get(&self._guard.session_id)
+            .ok_or_else(|| io::Error::other("session closed"))?;
+        let route = &session.route;
+        Ok(BackendHttpPoolKey {
+            relay_address: route.relay_address.clone(),
+            instance_id: route.target.instance_id.clone(),
+            workload_id: route.target.workload_id.clone(),
+            target_ip: route.target.target_ip,
+            target_port: route.target.target_port,
+        })
+    }
+
     #[cfg(feature = "agent-api")]
     pub(super) fn cancellation(&self) -> watch::Receiver<bool> {
         self.cancelled.clone()
@@ -3829,6 +3877,32 @@ mod access_policy_tests;
 #[cfg(test)]
 mod watch_close_contract_tests {
     use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn route_cancellation_retains_watch_close_contract() {
+        let (sender, receiver) = watch::channel(false);
+        drop(sender);
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            wait_for_route_cancellation(Some(receiver)),
+        )
+        .await
+        .expect("existing forwarding paths cancel when the route owner closes");
+
+        for initially_cancelled in [false, true] {
+            let (sender, receiver) = watch::channel(initially_cancelled);
+            let waiting = tokio::spawn(wait_for_route_cancellation(Some(receiver)));
+            if !initially_cancelled {
+                sender.send(true).unwrap();
+            }
+            drop(sender);
+            tokio::time::timeout(Duration::from_millis(1), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn last_command_subscription_closes_downstream_websocket_cleanly() {

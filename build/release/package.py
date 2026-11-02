@@ -18,6 +18,7 @@ from package_manifest import (  # noqa: E402
     AFS_BINARIES,
     BINARIES,
     GVISOR_BINARIES,
+    OPTIONAL_BINARIES,
     SANDBOXD_BINARIES,
     SANDBOXD_DEPLOYMENT_FILES,
 )
@@ -40,6 +41,10 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
+    for name in OPTIONAL_BINARIES:
+        source = binary_dir / name
+        if source.exists() or source.is_symlink():
+            inputs[f"bin/{name}"] = source
     if with_afs:
         inputs.update({f"bin/{name}": binary_dir / name for name in AFS_BINARIES})
     inputs["runtime/adx-execd"] = binary_dir / "adx-execd"

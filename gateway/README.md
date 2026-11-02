@@ -26,6 +26,18 @@ The typed public Ingress → Relay → EXECD operations are defined by the
 Generic port forwarding and reverse tunnels carry application-defined protocols
 and remain outside that typed API.
 
+With `agent-api`, optional `ADX_CREDENTIAL_CRYPTO_CONFIG` enables internal TLS
+`POST /v1/seal` and `/v1/open` for one fixed ADX-managed Crypto Binding.
+The adapter verifies each workspace grant/context through the existing `ADX_AGENT_CONFIG`
+control client before activation, then uses `AgentV2Access`, Relay and verified backend TLS.
+Crypto verifies the grant again; Gateway holds no encryption key. Exchanges use fresh
+connections with the shared endpoint quota; ordinary HTTP pooling and WebSocket cancellation
+are unchanged. An optional `frontend_host` isolates these paths; conflicting application or
+control-plane routes are rejected at startup. Gateway emits pseudonymous events to the existing audit log.
+Unconfigured Gateways retain their existing routes. See the
+[deployment guide](../docs/deployment/credential-crypto.md#adx-模板托管) for trust boundaries,
+limits, error codes and [configuration](../build/config/examples/credential-crypto-gateway.json).
+
 The default `activity-client` feature builds the managed Ingress and Relay entrypoints. Embedded and standalone Ingress both use `ingress::IngressService`; only the owning process changes. Standalone Ingress requires `ADX_INGRESS_CONTROL_CONFIG` pointing to [ingress-control.json](../build/config/examples/ingress-control.json). Coordinator must map the Ingress client certificate to the `ingress` role. Public listener TLS and Ingress-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Ingress entrypoint uses the new Coordinator route service.
 
 The gateway is a member of the root Cargo workspace. Run from repository root:

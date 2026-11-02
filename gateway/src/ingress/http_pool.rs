@@ -152,6 +152,56 @@ impl BackendHttpPool {
         self.inner.remove_matching(|_| true);
     }
 
+    /// Fresh transport for buffered Crypto requests; never uses or returns an idle sender.
+    /// The caller must keep the returned endpoint permit until the reply is consumed or dropped.
+    #[cfg(feature = "agent-api")]
+    pub(super) async fn send_one_shot<T>(
+        &self,
+        key: BackendHttpPoolKey,
+        mut request: Request<http_body_util::Full<Bytes>>,
+        stream: T,
+    ) -> Result<(Response<Incoming>, OwnedSemaphorePermit), BackendHttpPoolError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        normalize_http1_request(&mut request);
+        request
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        let endpoint = self.inner.endpoint(&key);
+        let permit = timeout(
+            self.inner.config.acquire_timeout,
+            endpoint.permits.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            self.inner
+                .acquire_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
+            BackendHttpPoolError::Saturated
+        })?
+        .map_err(|_| BackendHttpPoolError::Closed)?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(BackendHttpPoolError::Handshake)?;
+        self.inner.opened_total.fetch_add(1, Ordering::Relaxed);
+        let pool = Arc::downgrade(&self.inner);
+        tokio::spawn(adx_observability::trace::with_current_context(async move {
+            let result = connection.await;
+            if let Some(pool) = pool.upgrade() {
+                pool.discarded_total.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Err(error) = result {
+                tracing::debug!(%error, "one-shot environment HTTP connection closed");
+            }
+        }));
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(BackendHttpPoolError::Request)?;
+        Ok((response, permit))
+    }
+
     pub async fn send<F, Fut, T>(
         &self,
         key: BackendHttpPoolKey,
@@ -502,6 +552,139 @@ mod retry_tests {
     use hyper::service::service_fn;
     use std::convert::Infallible;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(feature = "agent-api")]
+    async fn incoming_request(close: bool) -> Request<Incoming> {
+        let (front, incoming) = tokio::io::duplex(8192);
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let sent = Mutex::new(Some(sent));
+        let server = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(
+                    TokioIo::new(incoming),
+                    service_fn(move |request| {
+                        sent.lock().unwrap().take().unwrap().send(request).unwrap();
+                        async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::new()))) }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(front))
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        let mut request = Request::new(Full::new(Bytes::new()));
+        if close {
+            request
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        }
+        sender
+            .send_request(request)
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap();
+        drop(sender);
+        connection.await.unwrap().unwrap();
+        server.await.unwrap();
+        received.await.unwrap()
+    }
+
+    #[cfg(feature = "agent-api")]
+    fn backend_response(
+        body: &'static [u8],
+    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        let (stream, peer) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(peer),
+                    service_fn(move |_: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(body))))
+                    }),
+                )
+                .await;
+        });
+        (stream, task)
+    }
+
+    #[cfg(feature = "agent-api")]
+    #[tokio::test]
+    async fn one_shot_isolates_transport_but_shares_quota_and_preserves_ordinary_reuse() {
+        let pool = BackendHttpPool::new(BackendHttpPoolConfig {
+            max_connections_per_endpoint: 1,
+            acquire_timeout: Duration::from_millis(10),
+            ..BackendHttpPoolConfig::default()
+        });
+        let key = BackendHttpPoolKey {
+            relay_address: "relay".into(),
+            instance_id: "instance".into(),
+            workload_id: "workload".into(),
+            target_ip: "127.0.0.1".parse().unwrap(),
+            target_port: 8080,
+        };
+        let (plain, plain_backend) = backend_response(b"ordinary");
+        pool.send(key.clone(), incoming_request(false).await, || async {
+            Ok(plain)
+        })
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+        assert_eq!(pool.metrics().idle_connections, 1);
+        let (verified, verified_backend) = backend_response(b"verified");
+        let (response, permit) = pool
+            .send_one_shot(key.clone(), Request::new(Full::new(Bytes::new())), verified)
+            .await
+            .unwrap();
+        // The Crypto body still owns the endpoint quota, including against ordinary requests.
+        let blocked = pool
+            .send(key.clone(), incoming_request(true).await, || async {
+                Err::<tokio::io::DuplexStream, _>(io::Error::other(
+                    "quota must block before connect",
+                ))
+            })
+            .await;
+        assert!(matches!(blocked, Err(BackendHttpPoolError::Saturated)));
+        assert_eq!(pool.metrics().acquire_timeouts_total, 1);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "verified"
+        );
+        assert_eq!(pool.metrics().opened_total, 2);
+        assert_eq!(pool.metrics().reused_total, 0);
+        assert_eq!(
+            pool.metrics().idle_connections,
+            1,
+            "one-shot must not enter the ordinary pool"
+        );
+        drop(permit);
+        // Releasing Crypto's response quota leaves the original idle sender available to normal close requests.
+        let response = pool
+            .send(key, incoming_request(true).await, || async {
+                Err::<tokio::io::DuplexStream, _>(io::Error::other(
+                    "ordinary connection must be reused",
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "ordinary"
+        );
+        assert_eq!(pool.metrics().reused_total, 1);
+        assert_eq!(pool.metrics().idle_connections, 0);
+        pool.clear();
+        plain_backend.abort();
+        verified_backend.abort();
+    }
 
     async fn exercise(fail_before_send: bool) {
         let pool = BackendHttpPool::new(BackendHttpPoolConfig::default());

@@ -13,6 +13,42 @@ s.loader.exec_module(pkg)
 
 
 class PackageTests(unittest.TestCase):
+    def test_crypto_binary_is_optional_and_checked_when_present(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in (*[name for name in pkg.BINARIES if name != "adx-credential-crypto"], "adx-execd"):
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
+            wheel = root / "adx_environment-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture")
+            identity = pkg.BuildIdentity("a" * 40, True, "test-fixture", "debug")
+            output = root / "without-crypto"
+            manifest = pkg.assemble(binaries, redis, redis_cli, wheel, output, identity)
+            self.assertNotIn("bin/adx-credential-crypto", manifest["files"])
+            pkg.verify(output)
+
+            (binaries / "adx-credential-crypto").write_bytes(b"fixture")
+            output = root / "with-crypto"
+            manifest = pkg.assemble(binaries, redis, redis_cli, wheel, output, identity)
+            self.assertIn("bin/adx-credential-crypto", manifest["files"])
+            pkg.verify(output)
+            (output / "bin/adx-credential-crypto").write_bytes(b"tampered")
+            with self.assertRaises(ValueError):
+                pkg.verify(output)
+
+            crypto = binaries / "adx-credential-crypto"
+            crypto.unlink()
+            crypto.symlink_to(root / "missing")
+            with self.assertRaises(ValueError):
+                pkg.assemble(binaries, redis, redis_cli, wheel, root / "broken-link", identity)
+
     def test_inspector_is_part_of_the_platform_release(self):
         self.assertIn("adx-inspect", pkg.BINARIES)
 
@@ -200,6 +236,7 @@ class PackageTests(unittest.TestCase):
                 "adxlet",
                 "adx-apiserver",
                 "adx-activator",
+                "adx-credential-crypto",
                 "adx-ingress",
                 "adx-relay",
             }

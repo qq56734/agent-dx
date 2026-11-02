@@ -1,7 +1,13 @@
 //! Deployment-owned TLS files and shared HTTP/gRPC TLS builders.
 use adx_protocol::auth::{Peers, Principal};
 use serde::Deserialize;
-use std::{collections::BTreeMap, fs::File, io::BufReader, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{BufRead, BufReader},
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio_rustls::TlsAcceptor;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 #[derive(Clone, Deserialize)]
@@ -49,27 +55,60 @@ pub fn http_server_acceptor(
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
     crate::install_crypto_provider();
-    let certificate = certificate.into();
-    let private_key = private_key.into();
-    let mut cert_reader = BufReader::new(File::open(certificate)?);
-    let certificates = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let mut certificate = BufReader::new(File::open(certificate.into())?);
+    let certificates = server_certificates(&mut certificate, "TLS certificate file is empty")?;
+    let mut private_key = BufReader::new(File::open(private_key.into())?);
+    let key = rustls_pemfile::private_key(&mut private_key)?.ok_or("TLS private key is empty")?;
+    let client_ca = client_ca
+        .map(|path| {
+            let mut reader = BufReader::new(File::open(path)?);
+            server_certificates(&mut reader, "TLS client CA file is empty")
+        })
+        .transpose()?;
+    server_acceptor(certificates, key, client_ca, alpn_protocols)
+}
+
+/// Same ADX TLS policy for callers that validate private files before parsing them.
+/// Returns an error for empty/invalid PEM, mismatched keys or invalid client trust.
+pub fn http_server_acceptor_pem(
+    mut certificate: &[u8],
+    mut private_key: &[u8],
+    client_ca: Option<&[u8]>,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
+    crate::install_crypto_provider();
+    let certificates = server_certificates(&mut certificate, "TLS certificate file is empty")?;
+    let key = rustls_pemfile::private_key(&mut private_key)?.ok_or("TLS private key is empty")?;
+    let client_ca = client_ca
+        .map(|mut reader| server_certificates(&mut reader, "TLS client CA file is empty"))
+        .transpose()?;
+    server_acceptor(certificates, key, client_ca, alpn_protocols)
+}
+
+fn server_certificates(
+    reader: &mut dyn BufRead,
+    empty_error: &'static str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let certificates = rustls_pemfile::certs(reader).collect::<Result<Vec<_>, _>>()?;
     if certificates.is_empty() {
-        return Err("TLS certificate file is empty".into());
+        return Err(empty_error.into());
     }
-    let mut key_reader = BufReader::new(File::open(private_key)?);
-    let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or("TLS private key is empty")?;
+    Ok(certificates)
+}
+
+fn server_acceptor(
+    certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+    client_ca: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
     let builder = rustls::ServerConfig::builder();
     let mut config = match client_ca {
         None => builder
             .with_no_client_auth()
             .with_single_cert(certificates, key)?,
-        Some(client_ca) => {
-            let mut ca_reader = BufReader::new(File::open(client_ca)?);
-            let ca_certificates =
-                rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
-            if ca_certificates.is_empty() {
-                return Err("TLS client CA file is empty".into());
-            }
+        Some(ca_certificates) => {
             let mut roots = rustls::RootCertStore::empty();
             for certificate in ca_certificates {
                 roots.add(certificate)?;
@@ -84,6 +123,7 @@ pub fn http_server_acceptor(
     config.alpn_protocols = alpn_protocols;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
+
 impl TlsFiles {
     pub fn load_rpc(
         &self,

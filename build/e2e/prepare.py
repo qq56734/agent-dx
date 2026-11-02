@@ -174,6 +174,9 @@ def main():
         # Artifact transport may drop Unix mode bits; identity was verified above.
         for name in package.BINARIES:
             (context / 'package/bin' / name).chmod(0o755)
+        for name in package.OPTIONAL_BINARIES:
+            if f'bin/{name}' in manifest['files']:
+                (context / 'package/bin' / name).chmod(0o755)
         (context / 'package/bin/redis-server').chmod(0o755)
         (context / 'package/runtime/adx-execd').chmod(0o755)
         (context / 'backend').mkdir()

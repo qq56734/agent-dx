@@ -17,6 +17,7 @@ BINARIES = (
     "adx-ingress",
     "adx-relay",
 )
+OPTIONAL_BINARIES = ("adx-credential-crypto",)
 SANDBOXD_BINARIES = ("sandboxd", "sbox", "runc", "runc-shim", "sandbox-logger", "redis-cli")
 GVISOR_BINARIES = (
     "runsc",

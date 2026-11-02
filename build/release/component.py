@@ -32,6 +32,7 @@ REQUIRED_FILES = {
     "afs": {"afs-meta", "afs-node"},
 }
 OPTIONAL_FILE_SETS = {
+    "gateway": {"adx-credential-crypto"},
     "execd": {"envd-LICENSE", "envd-manifest.json"},
 }
 

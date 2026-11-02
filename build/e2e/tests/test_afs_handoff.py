@@ -327,8 +327,8 @@ class CiBoundaryTests(unittest.TestCase):
 class ImageHandoffTests(unittest.TestCase):
     def test_prepare_stages_only_on_assets_and_checks_them_in_node_image(self):
         module = load_module("prepare_afs_assets", E2E / "prepare.py")
-        for with_afs in (False, True):
-            with self.subTest(with_afs=with_afs), tempfile.TemporaryDirectory() as directory:
+        for with_afs, with_crypto in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(with_afs=with_afs, with_crypto=with_crypto), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 product = {
                     "commit": "a" * 40, "target": "x86_64-unknown-linux-gnu",
@@ -339,6 +339,8 @@ class ImageHandoffTests(unittest.TestCase):
                 names += ["bin/redis-server", "runtime/adx-execd"]
                 if with_afs:
                     names += ["bin/afs-meta", "bin/afs-node"]
+                if with_crypto:
+                    names.append("bin/adx-credential-crypto")
                 for name in names:
                     path = package / name
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,13 +371,18 @@ class ImageHandoffTests(unittest.TestCase):
                 inspected = []
 
                 def docker(
-                    command, selected_mode=with_afs, selected_target=product["target"], seen=inspected, **_kwargs,
+                    command, selected_mode=with_afs, selected_crypto=with_crypto,
+                    selected_target=product["target"], seen=inspected, **_kwargs,
                 ):
                     self.assertEqual(command[0], "/fixture/docker")
                     if command[1] == "save":
                         Path(command[command.index("-o") + 1]).write_bytes(b"fixture archive")
                     elif command[1] == "build" and "Dockerfile.node" in command[command.index("-f") + 1]:
                         context = Path(command[-1])
+                        crypto = context / "package/bin/adx-credential-crypto"
+                        self.assertEqual(crypto.exists(), selected_crypto)
+                        if selected_crypto:
+                            self.assertTrue(crypto.stat().st_mode & 0o111)
                         assets = context / "e2e/afs-tests"
                         self.assertEqual(assets.exists(), selected_mode)
                         commands = [
