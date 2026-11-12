@@ -1474,6 +1474,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

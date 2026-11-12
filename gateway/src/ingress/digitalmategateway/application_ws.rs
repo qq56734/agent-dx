@@ -1,7 +1,7 @@
 //! Session admission for a configured template reference; transport stays in shared Gateway forwarding.
 use super::entrypoint::{agent_error, auth_error, error};
 use crate::ingress::{
-    accounts::{BusinessAuth, Principal, SessionGuard},
+    accounts::SessionGuard,
     agent_service::{AgentV2Access, InitializationError, ServiceAccessError, ServiceSelector},
     server::{proxy_http, wait_for_route_cancellation, Ingress, ProxyBody},
 };
@@ -105,10 +105,12 @@ impl ApplicationWsConfig {
         mut request: Request<Incoming>,
         ingress: Arc<Ingress>,
         managed: Arc<ManagedService>,
-        auth: Arc<dyn BusinessAuth>,
-        principal: Principal,
+        guard: Arc<SessionGuard>,
         tenant: &str,
+        #[cfg(unix)] privacy: Option<Arc<super::privacy_delivery::Delivery>>,
     ) -> Response<ProxyBody> {
+        let auth = guard.auth.clone();
+        let principal = guard.principal.clone();
         if request.method() != http::Method::GET {
             return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
         }
@@ -137,16 +139,30 @@ impl ApplicationWsConfig {
             self.request_timeout_seconds,
         )));
         let deadline = context.deadline();
-        let guard = Arc::new(SessionGuard {
-            auth: auth.clone(),
-            principal: principal.clone(),
-        });
         let mut session = Box::pin({
             let guard = guard.clone();
             async move { guard.watch().await }
         });
+        #[cfg(unix)]
+        let managed_for_privacy = managed.clone();
         let access = AgentV2Access::new(managed);
         let admission = async {
+            #[cfg(unix)]
+            if let Some(delivery) = privacy
+                .as_ref()
+                .filter(|delivery| delivery.targets(&self.template))
+            {
+                return self
+                    .privacy_connect(
+                        &ingress,
+                        &managed_for_privacy,
+                        &guard,
+                        &scope,
+                        context.clone(),
+                        delivery,
+                    )
+                    .await;
+            }
             let selection = access
                 .select_with_initializer(
                     context,
@@ -234,6 +250,101 @@ impl ApplicationWsConfig {
             return end_response(*reason.borrow());
         }
         response
+    }
+
+    /// A freshly generated identity directory belongs to one Binding attempt only.
+    /// Do not replay its initialization parameters when a Binding is deleted.
+    #[cfg(unix)]
+    async fn privacy_connect(
+        &self,
+        ingress: &Arc<Ingress>,
+        managed: &Arc<ManagedService>,
+        guard: &SessionGuard,
+        scope: &Scope,
+        context: Arc<RequestContext>,
+        delivery: &Arc<super::privacy_delivery::Delivery>,
+    ) -> Result<crate::ingress::server::IngressStream, Response<ProxyBody>> {
+        use crate::ingress::{resolver::AccessKind, server::IngressOpenError};
+        let tenant = &scope.tenant;
+        let auth = &guard.auth;
+        let principal = &guard.principal;
+        let workspace =
+            super::entrypoint::workspace_parameters(tenant, &self.template, &principal.user_id)
+                .map_err(agent_error)?;
+        let workspace_id = workspace
+            .get("workspace")
+            .cloned()
+            .ok_or_else(|| auth_error(crate::ingress::accounts::Error::Invalid))?;
+        let parameters = match context.run(managed.binding(&context, scope)).await {
+            Ok(binding) => {
+                if binding.parameters.get("workspace") != Some(&workspace_id)
+                    || !binding.parameters.contains_key("privacy_identity")
+                {
+                    return Err(error(StatusCode::CONFLICT, "PRIVACY_MIGRATION_REQUIRED"));
+                }
+                None
+            }
+            Err(Error::NotFound) => {
+                let mut values = auth.model_parameters(principal).await.map_err(auth_error)?;
+                let identity = delivery
+                    .prepare(scope, &workspace_id, &principal.user_id)
+                    .await
+                    .map_err(auth_error)?;
+                values.extend(workspace);
+                values.insert("privacy_identity".into(), identity);
+                Some(adx_agent_core::parameters::encode(&values))
+            }
+            Err(error) => return Err(agent_error(error)),
+        };
+        let (target, port) = context
+            .run(managed.resolve_with_parameters(
+                &context,
+                scope,
+                Protocol::Ws,
+                Some(self.service_port),
+                parameters.as_deref(),
+                false,
+            ))
+            .await
+            .map_err(agent_error)?;
+        if target.binding.parameters.get("workspace") != Some(&workspace_id)
+            || !target.binding.parameters.contains_key("privacy_identity")
+        {
+            return Err(error(StatusCode::CONFLICT, "PRIVACY_MIGRATION_REQUIRED"));
+        }
+        let route = context
+            .run(async {
+                Ok(ingress
+                    .resolve_route(
+                        &target.binding.current.environment_id,
+                        port,
+                        AccessKind::Direct,
+                        String::new(),
+                    )
+                    .await)
+            })
+            .await
+            .map_err(agent_error)?
+            .map_err(|_| error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE"))?;
+        loop {
+            let opened = context
+                .run(async {
+                    Ok(ingress
+                        .open_resolved_stream(route.clone(), &scope.tenant)
+                        .await)
+                })
+                .await
+                .map_err(agent_error)?;
+            match opened {
+                Ok(stream) => return Ok(stream),
+                Err(IngressOpenError::Connect(error))
+                    if error.kind() == std::io::ErrorKind::ConnectionRefused =>
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(_) => return Err(error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE")),
+            }
+        }
     }
 }
 
@@ -361,6 +472,46 @@ mod tests {
         let mut next = template.clone();
         next.version = "2".into();
         assert_eq!(volumes, next.render_volumes(&parameters).unwrap());
+    }
+
+    #[test]
+    fn privacy_template_keeps_workspace_readonly_identity_and_background_lifecycle() {
+        use adx_agent_core::mounts::Parameters;
+        let draft: adx_agent_core::TemplateDraft = serde_json::from_str(include_str!(
+            "../../../examples/digitalmate-privacy-template.json"
+        ))
+        .unwrap();
+        draft.validate().unwrap();
+        let template = draft.with_version("1".into());
+        let values = Parameters::from([
+            ("workspace".into(), "w-existing-user".into()),
+            ("privacy_identity".into(), "i-fixture".into()),
+            ("model_api_base".into(), "https://model.example/v1".into()),
+            ("model_api_key".into(), "synthetic-key".into()),
+        ]);
+        let volumes = template.render_volumes(&values).unwrap();
+        assert_eq!(
+            volumes[0].source,
+            adx_agent_core::volumes::VolumeSource::Directory {
+                storage_domain: "sfs".into(),
+                path: "workspaces/w-existing-user".into()
+            }
+        );
+        assert_eq!(
+            volumes[1].source,
+            adx_agent_core::volumes::VolumeSource::Directory {
+                storage_domain: "sfs".into(),
+                path: "credential-identities/users/i-fixture".into()
+            }
+        );
+        let mounts = template.render_mounts(&values).unwrap();
+        assert_eq!(mounts[1].target, "/run/orbit-crypto");
+        assert_eq!(mounts[1].options, vec!["ro"]);
+        assert_eq!(template.lifecycle.idle_timeout_seconds, 0);
+        assert_eq!(
+            template.render_env(&values).unwrap()["DIGITALMATE_SECRET_STORE"],
+            "privacy"
+        );
     }
 
     #[test]

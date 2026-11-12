@@ -1,0 +1,36 @@
+{
+  "name": "orbit",
+  "image": "registry.example.invalid/digitalmate:replace-before-publishing",
+  "isolation_runtime": "runsc",
+  "env": {
+    "DIGITALMATE_WORKSPACE": "/data/state",
+    "DIGITALMATE_BIND": "0.0.0.0",
+    "DIGITALMATE_PORT": "18092",
+    "API_BASE": "${model_api_base}",
+    "API_KEY": "${model_api_key}",
+    "MODEL_NAME": "glm-5.2",
+    "MODEL_PROVIDER": "OpenAI",
+    "DIGITALMATE_SECRET_STORE": "privacy",
+    "DIGITALMATE_CRYPTO_URL": "https://privacy.internal.example:18444",
+    "DIGITALMATE_CRYPTO_TOKEN_FILE": "/run/orbit-crypto/identity",
+    "DIGITALMATE_CRYPTO_CA_FILE": "/run/orbit-crypto/ca.pem",
+    "DIGITALMATE_CRYPTO_TENANT": "digitalmate",
+    "DIGITALMATE_CRYPTO_WORKSPACE": "${workspace}",
+    "DIGITALMATE_CRYPTO_PURPOSE": "orbit-config",
+    "DIGITALMATE_PRIVACY_BOOTSTRAP_TIMEOUT_SECONDS": "60",
+    "DIGITALMATE_CLIENT_AUTH": "gateway"
+  },
+  "resources": { "cpu_millis": 2000, "memory_mib": 4096 },
+  "service": [ { "protocol": "ws", "port": 18092 }, { "protocol": "http", "port": 18092 } ],
+  "init_timeout_seconds": 120,
+  "readiness_probe": { "tcp_socket": { "port": 18092 }, "initial_delay_seconds": 3, "period_seconds": 3, "timeout_seconds": 2 },
+  "lifecycle": { "idle_timeout_seconds": 0, "idle_action": "delete" },
+  "mounts": [
+    { "type": "bind", "target": "/data/state", "options": ["rw"], "volume_id": "orbit-workspace-${workspace}" },
+    { "type": "bind", "target": "/run/orbit-crypto", "options": ["ro"], "volume_id": "privacy-identity-${privacy_identity}" }
+  ],
+  "volumes": [
+    { "id": "orbit-workspace-${workspace}", "source": { "type": "directory", "storage_domain": "sfs", "path": "workspaces/${workspace}" }, "access_mode": "shared", "create_if_missing": true, "create_options": { "uid": 10001, "gid": 10001, "mode": "0700" } },
+    { "id": "privacy-identity-${privacy_identity}", "source": { "type": "directory", "storage_domain": "sfs", "path": "credential-identities/users/${privacy_identity}" }, "access_mode": "shared", "create_if_missing": false }
+  ]
+}
