@@ -1,0 +1,71 @@
+{
+  "name": "orbit",
+  "image": "registry.example.invalid/digitalmate:replace-before-publishing",
+  "isolation_runtime": "runsc",
+  "env": {
+    "DIGITALMATE_WORKSPACE": "/data/state",
+    "DIGITALMATE_BIND": "0.0.0.0",
+    "DIGITALMATE_PORT": "18092",
+    "API_BASE": "${model_api_base}",
+    "API_KEY": "${model_api_key}",
+    "MODEL_NAME": "glm-5.2",
+    "MODEL_PROVIDER": "OpenAI",
+    "DIGITALMATE_SECRET_STORE": "privacy",
+    "DIGITALMATE_CRYPTO_URL": "https://privacy.internal.example:18444",
+    "DIGITALMATE_CRYPTO_CA_FILE": "/etc/digitalmate/privacy-ca.pem",
+    "DIGITALMATE_CRYPTO_TENANT": "digitalmate",
+    "DIGITALMATE_CRYPTO_WORKSPACE": "${workspace}",
+    "DIGITALMATE_CRYPTO_PURPOSE": "orbit-config",
+    "DIGITALMATE_CLIENT_AUTH": "gateway"
+  },
+  "resources": {
+    "cpu_millis": 2000,
+    "memory_mib": 4096
+  },
+  "service": [
+    {
+      "protocol": "ws",
+      "port": 18092
+    },
+    {
+      "protocol": "http",
+      "port": 18092
+    }
+  ],
+  "init_timeout_seconds": 120,
+  "readiness_probe": {
+    "tcp_socket": {
+      "port": 18092
+    },
+    "initial_delay_seconds": 3,
+    "period_seconds": 3,
+    "timeout_seconds": 2
+  },
+  "mounts": [
+    {
+      "type": "bind",
+      "target": "/data/state",
+      "options": [
+        "rw"
+      ],
+      "volume_id": "orbit-workspace-${workspace}"
+    }
+  ],
+  "volumes": [
+    {
+      "id": "orbit-workspace-${workspace}",
+      "source": {
+        "type": "directory",
+        "storage_domain": "sfs",
+        "path": "workspaces/${workspace}"
+      },
+      "access_mode": "shared",
+      "create_if_missing": true,
+      "create_options": {
+        "uid": 10001,
+        "gid": 10001,
+        "mode": "0700"
+      }
+    }
+  ]
+}
